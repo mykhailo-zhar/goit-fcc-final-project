@@ -162,60 +162,186 @@ docker push 083665737973.dkr.ecr.eu-central-1.amazonaws.com/fcc/final-project:la
 
 Task definition may pin a digest: `.../fcc/final-project@sha256:...`.
 
-## IAM / SSM
+## ECS Task Definition
 
-| Role | Use |
+Task definition is the blueprint for the Fargate task: image, ports, CPU/memory, IAM roles, and environment (including secrets).
+
+| Item | Value |
 |---|---|
-| `fp-ecs-task-execution-role` | **Task execution role** (required) |
-| Task role | **None** — app does not call AWS APIs |
-| `goit-fp-ecs-role` | ECS infrastructure / Service Gateway — **not** the task execution role |
+| Family | `goit-fp-ecs-task` (revisions `:1`, `:2`, `:3`, …) |
+| Launch type / compatibility | Fargate |
+| Container name | `Main` (essential) |
+| Image | `083665737973.dkr.ecr.eu-central-1.amazonaws.com/fcc/final-project` (tag `latest` or digest) |
+| Port mapping | **Container port `3000`**, protocol TCP, app protocol HTTP (not 80) |
+| CPU / memory (observed) | 0.5 vCPU / 1 GiB (prefer ≤ this on Free Tier) |
+| Task role | **None** |
+| Task execution role | **`fp-ecs-task-execution-role`** |
+| Log driver | `awslogs` → CloudWatch Logs (via execution role) |
 
-Execution role:
+### IAM roles on the task definition
 
-- Trust: `ecs-tasks.amazonaws.com`
-- Managed: `AmazonECSTaskExecutionRolePolicy`
-- Extra: `ssm:GetParameter`, `ssm:GetParameters` on:
+| Field | Role | Purpose |
+|---|---|---|
+| **Task execution role** | `fp-ecs-task-execution-role` | Used by the **ECS agent**: pull image from ECR, write CloudWatch logs, read SSM SecureString and decrypt with KMS at task start |
+| **Task role** | `None` | Used by **application code** (AWS SDK). This API talks to Postgres, Valkey, SMTP, GitHub — not AWS APIs — so no task role |
+| (not on task def) | `goit-fp-ecs-role` | ECS infrastructure / Service Gateway only — do **not** select it as execution/task role |
 
-  - `arn:aws:ssm:eu-central-1:083665737973:parameter/fp-ecs-database-url`
-  - `arn:aws:ssm:eu-central-1:083665737973:parameter/fp-ecs-smtp-pass`
+`fp-ecs-task-execution-role` configuration:
 
-- Extra: `kms:Decrypt` on default SSM key:
+- Trust policy principal: `ecs-tasks.amazonaws.com`
+- Managed policy: `AmazonECSTaskExecutionRolePolicy` (ECR + logs)
+- Inline / custom policy for secrets:
 
-  `arn:aws:kms:eu-central-1:083665737973:key/590c8b9a-7e8c-470c-929b-646b39173fb4`
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameters", "ssm:GetParameter"],
+      "Resource": [
+        "arn:aws:ssm:eu-central-1:083665737973:parameter/fp-ecs-database-url",
+        "arn:aws:ssm:eu-central-1:083665737973:parameter/fp-ecs-smtp-pass"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "arn:aws:kms:eu-central-1:083665737973:key/590c8b9a-7e8c-470c-929b-646b39173fb4"
+    }
+  ]
+}
+```
 
-### Parameter Store (SecureString)
+KMS key above is the account default **AWS managed `aws/ssm`** key used by SecureString parameters.
 
-| Name | Maps to env |
+### Secrets storage (SSM Parameter Store)
+
+Sensitive values are **not** baked into the image and **not** stored as plaintext in the task definition. They live in **Systems Manager Parameter Store** (Standard tier, type **SecureString**), encrypted with `aws/ssm`.
+
+| Parameter name | Type | Injected as env | Value type in task def |
+|---|---|---|---|
+| `fp-ecs-database-url` | SecureString | `DATABASE_URL` | **ValueFrom** (SSM ARN / name) |
+| `fp-ecs-smtp-pass` | SecureString | `SMTP_PASS` | **ValueFrom** |
+
+At task start the execution role fetches and decrypts these parameters; ECS injects them into the container environment. Secrets Manager is **not** used (user choice).
+
+### Non-secret environment variables (Value)
+
+| Key | Typical value / notes |
 |---|---|
-| `fp-ecs-database-url` | `DATABASE_URL` (`valueFrom`) |
-| `fp-ecs-smtp-pass` | `SMTP_PASS` (`valueFrom`) |
+| `NODE_ENV` | `production` |
+| `PORT` | `3000` |
+| `GRPC_PORT` | `50051` |
+| `APP_BASE_URL` | ALB URL, e.g. `http://<alb-dns>` (**required** in production) |
+| `REDIS_URL` | `redis://<valkey-primary-endpoint>:6379` |
+| `SMTP_HOST` | e.g. `sandbox.smtp.mailtrap.io` |
+| `SMTP_PORT` | **`587`** (STARTTLS). Avoid `465` with Mailtrap from ECS (`secure: true` path failed in practice) |
+| `SMTP_USER` | SMTP username |
+| `SMTP_FROM` | Valid email address (`z.string().email()`) |
+| `CACHE_TTL_SECONDS` / `SCAN_INTERVAL_SECONDS` | optional; defaults in `src/config.ts` |
+| `GITHUB_TOKEN` | optional; higher GitHub rate limit |
 
-Non-secret task env typically: `NODE_ENV=production`, `PORT=3000`, `GRPC_PORT=50051`, `SMTP_HOST`, `SMTP_PORT=587`, `SMTP_USER`, `SMTP_FROM` (valid email), `REDIS_URL`, **`APP_BASE_URL`** (required in production). Mailtrap sandbox was used (`sandbox.smtp.mailtrap.io`). Use **`SMTP_PORT=587`** (STARTTLS); `465` enables `secure: true` in `email-notifier.ts` and failed against Mailtrap from ECS.
+Flow:
 
-## ECS
+```text
+SSM SecureString  --(execution role: ssm + kms)-->  Task Definition valueFrom
+Plain env Value   -------------------------------->  Container process.env
+ECR image         --(execution role: ecr)--------->  Fargate task
+```
+
+## ECS Service + ALB + Auto Scaling
+
+Long-running service that keeps Fargate tasks at the desired count, registers them with the ALB target group, and scales on CPU.
+
+### Service
 
 | Item | Value |
 |---|---|
 | Cluster | `goit-fp-ecs-cluster` |
-| Service | `golt-fp-ecs` (typo `golt` vs `goit` is cosmetic) |
-| Task definition | `golt-fp-ecs-task` revision 1+ |
-| Launch | Fargate, capacity provider `FARGATE` weight 1 |
-| Desired count | **1** |
-| AZ rebalancing | Off |
-| Networking | private subnet `subnet-0eb2d424c6822ae4e`, SG `fp-sg-ecs`, **Public IP off** |
-| Container name | `Main` (essential) |
-| Container port | **3000** / HTTP (not 80) |
-| CPU / memory | Prefer 0.25 vCPU / 0.5–1 GB on Free Tier (1 vCPU / 3 GB is expensive) |
+| Service | `goit-fp-ecs` |
+| Task definition | `goit-fp-ecs-task` revision **5** (Latest) |
+| Scheduling | **REPLICA** |
+| Desired tasks | **1** |
+| AZ rebalancing | **Off** (tasks stay in `eu-central-1a` with RDS/Valkey) |
+| Health check grace period | Console showed `0` — prefer **60–120 s** (Drizzle migrations on start) |
+| Deployment controller | ECS |
+| Deployment strategy | **Rolling update** |
+| Min running tasks % | `100` |
+| Max running tasks % | `200` |
+| Deployment bake time | `0` min |
 
-Health check path for ALB: `GET /health`. After attaching ALB, set health check grace period ~60–120s (migrations on startup).
+### Networking (service)
 
-ALB: at least **two public subnets** (1a + 1b). Listener 80 → target group HTTP:3000. gRPC 50051 is optional (needs HTTP/2 listener); REST is enough for the assignment public URL.
+| Item | Value |
+|---|---|
+| VPC | `final-project-vpc` (`vpc-056e5484f0469d7f9`) |
+| Subnet | `final-project-subnet-private1-eu-central-1a` (`subnet-0eb2d424c6822ae4e`, `10.0.128.0/20`) |
+| Security group | `fp-sg-ecs` (`sg-05cbb82dccb7af6d3`) |
+| Public IP | **Off** |
+
+### Load balancing (ALB)
+
+```text
+Internet --HTTP:80--> [fp-alb / fp-sg-alb] --HTTP:3000--> [fp-tg-1] --> task Main:3000 / fp-sg-ecs
+```
+
+| Item | Value |
+|---|---|
+| Load balancer | `fp-alb` (Application Load Balancer) |
+| Listener | **HTTP:80** |
+| Target group | `fp-tg-1` |
+| Container | **`Main:3000`** (ALB :80 ≠ container :3000 — correct) |
+| Health check | `GET /health` on port **3000** |
+| TG VPC | same as service (`vpc-056e5484f0469d7f9`) |
+
+ALB must use **both** public subnets (`1a` + `1b`). Do not set TG or registered target port to 80.
+
+### Security groups (service path)
+
+| SG | Role in this path |
+|---|---|
+| `fp-sg-alb` | Inbound TCP 80 from `0.0.0.0/0`; outbound/target path to ECS on **3000** |
+| `fp-sg-ecs` | Inbound TCP **3000** from `fp-sg-alb`; outbound to RDS `5432`, Valkey `6379`, HTTPS/SMTP via NAT |
+| `fp-sg-rds` / elastic SG | Unchanged — only from `fp-sg-ecs` |
+
+### Service Auto Scaling
+
+| Item | Value |
+|---|---|
+| Enabled | Yes |
+| Min tasks | **1** |
+| Max tasks | **2** |
+| Policy | Target tracking `fp-ecs-scale-policy` |
+| Metric | `ECSServiceAverageCPUUtilization` |
+| Target value | **80** |
+| Scale-out cooldown | 300 s |
+| Scale-in cooldown | 300 s |
+| Scale-in | Enabled |
+
+**Caveat:** release scanner runs in-process. At 2 tasks, duplicate notification emails are possible. Min 1 / max 2 satisfies the assignment Auto Scaling requirement for demo; keep desired at 1 for quiet email behavior.
+
+### CloudWatch alarm + SNS
+
+| Item | Value |
+|---|---|
+| Alarm | `fp-alarm` |
+| Namespace | `AWS/ECS` |
+| Dimensions | ServiceName=`goit-fp-ecs`, ClusterName=`goit-fp-ecs-cluster` |
+| Metric | `CPUUtilization` Average, period 5 min |
+| Threshold | `CPUUtilization > 95` for 1 datapoint within 5 minutes |
+| SNS topic | `fp-aws-topiic` (spelling as created) |
+| Example subscription ARN | `arn:aws:sns:eu-central-1:083665737973:fp-aws-topiic:c09afb5b-657e-4f2d-ba8a-0d46a2092093` |
+
+Alarm notifies via SNS on high CPU; Application Auto Scaling uses the separate target-tracking policy (target 80%). Both are valid for monitoring + scaling coursework.
+
+Public URL: `http://<fp-alb-dns-name>/` (set as `APP_BASE_URL`). Verify `GET /health`.
 
 ## App runtime notes
 
-- Drizzle migrations run on process start (`src/index.ts`). Concurrent tasks can race; keep one replica.
+- Drizzle migrations run on process start (`src/index.ts`). Concurrent tasks can race; prefer desired = 1 outside load tests.
 - Redis cache keys: `gh:repo-exists:*`, `gh:latest-release:*`.
-- Next assignment pieces if missing: ALB + public URL, CloudWatch logs/alarms + SNS, ECS Service Auto Scaling (max 2 for demo), AWS Budgets + Cost Explorer.
+- Remaining assignment pieces if missing: AWS Budgets + Cost Explorer screenshots / write-up.
 
 ## Agent do / don't
 
