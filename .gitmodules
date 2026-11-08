@@ -1,3 +1,3 @@
 [submodule "github-release-notification-api"]
-	path = github-release-notification-api
+	path = project
 	url = https://github.com/ViktorSvertoka/github-release-notification-api.git
