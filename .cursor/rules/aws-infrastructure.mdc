@@ -1,0 +1,17 @@
+---
+description: AWS account, VPC, ECS/RDS/ElastiCache/ECR IDs and constraints for this project's deployment. Read before changing AWS-related docs, task defs, or infra advice.
+alwaysApply: true
+---
+
+# AWS infrastructure
+
+Canonical resource IDs, SG model, and Free Tier constraints live in [docs/aws-reference.md](docs/aws-reference.md). Read that file before advising on or changing AWS setup.
+
+Hard rules:
+
+- One VPC only: `vpc-056e5484f0469d7f9` (`final-project-vpc`) in `eu-central-1`.
+- App container port is **3000**, not 80. Production needs `APP_BASE_URL`.
+- Task execution role is `fp-ecs-task-execution-role`; task role is None.
+- ECS desired count 1 (in-process release scanner). Data plane Single-AZ (`eu-central-1a`).
+- Never commit secrets. Credentials are SSM SecureString (`fp-ecs-database-url`, `fp-ecs-smtp-pass`), not Secrets Manager.
+- Do not mix security groups or DB instances from older VPCs (`vpc-01d0669d36357d0ed`, `vpc-08f69843a324f3f4c`).
